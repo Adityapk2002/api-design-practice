@@ -1,0 +1,393 @@
+import express, { Request, Response } from 'express';
+
+// Types
+export type Group = {
+  id: string;
+  size: number;
+  arrivalTime: number;
+}
+
+export type Table = {
+  id: string;
+  capacity: number;
+}
+
+// Internal tracking types
+type SeatedGroup = Group & {
+  seatedTime: number;
+  tableId: string;
+}
+
+type TableState = Table & {
+  occupiedBy?: string;
+  occupiedAt?: number;
+}
+
+// Restaurant Waitlist Manager
+class RestaurantWaitlist {
+  private waitlist: Group[] = [];
+  private tables: Map<string, TableState> = new Map();
+  private seatedGroups: Map<string, SeatedGroup> = new Map();
+  private readonly maxGroupSize: number;
+
+  constructor(maxGroupSize: number = 20) {
+    this.maxGroupSize = maxGroupSize;
+  }
+
+  // Join waitlist
+  joinWaitlist(group: Group): { success: boolean; message: string } {
+    if (group.size <= 0 || group.size > this.maxGroupSize) {
+      return { 
+        success: false, 
+        message: `Group size must be between 1 and ${this.maxGroupSize}` 
+      };
+    }
+
+    if (this.waitlist.some(g => g.id === group.id) || this.seatedGroups.has(group.id)) {
+      return { 
+        success: false, 
+        message: 'Group already exists in waitlist or is seated' 
+      };
+    }
+
+    this.waitlist.push(group);
+    return { success: true, message: 'Group added to waitlist' };
+  }
+
+  // Leave waitlist
+  leaveWaitlist(groupId: string): { success: boolean; message: string } {
+    const index = this.waitlist.findIndex(g => g.id === groupId);
+    if (index === -1) {
+      return { success: false, message: 'Group not found in waitlist' };
+    }
+
+    this.waitlist.splice(index, 1);
+    return { success: true, message: 'Group removed from waitlist' };
+  }
+
+  // Table becomes available - seat first fitting group
+  tableAvailable(table: Table, time: number): { 
+    success: boolean; 
+    seatedGroup?: SeatedGroup;
+    message: string;
+  } {
+    // Find first group that fits
+    const groupIndex = this.waitlist.findIndex(g => g.size <= table.capacity);
+    
+    if (groupIndex === -1) {
+      // No group fits, mark table as available
+      this.tables.set(table.id, { ...table });
+      return { 
+        success: false, 
+        message: 'No suitable group found, table marked as available' 
+      };
+    }
+
+    // Seat the group
+    const group = this.waitlist[groupIndex];
+    this.waitlist.splice(groupIndex, 1);
+
+    const seatedGroup: SeatedGroup = {
+      ...group,
+      seatedTime: time,
+      tableId: table.id
+    };
+
+    this.seatedGroups.set(group.id, seatedGroup);
+    this.tables.set(table.id, {
+      ...table,
+      occupiedBy: group.id,
+      occupiedAt: time
+    });
+
+    return { 
+      success: true, 
+      seatedGroup, 
+      message: 'Group seated successfully' 
+    };
+  }
+
+  // Group leaves restaurant
+  groupLeaves(groupId: string): { 
+    success: boolean; 
+    message: string; 
+    freedTable?: Table;
+  } {
+    const seatedGroup = this.seatedGroups.get(groupId);
+    if (!seatedGroup) {
+      return { success: false, message: 'Group not found in restaurant' };
+    }
+
+    const tableId = seatedGroup.tableId;
+    this.seatedGroups.delete(groupId);
+    
+    const table = this.tables.get(tableId);
+    if (table) {
+      const freedTable: Table = {
+        id: table.id,
+        capacity: table.capacity
+      };
+      
+      table.occupiedBy = undefined;
+      table.occupiedAt = undefined;
+
+      return { 
+        success: true, 
+        message: 'Group left, table freed', 
+        freedTable 
+      };
+    }
+
+    return { success: true, message: 'Group left successfully' };
+  }
+
+  // Process batch of groups and return seating times
+  processBatch(groups: Group[], tables: Table[]): {
+    seatingTimes: Record<string, number>;
+    currentDinerIds: string[];
+    waitingGroups: Group[];
+  } {
+    // Reset state
+    this.waitlist = [];
+    this.seatedGroups.clear();
+    this.tables.clear();
+
+    // Initialize tables
+    const availableTables = tables.map(t => ({ ...t, occupied: false }));
+    const seatingTimes: Record<string, number> = {};
+
+    // Sort groups by arrival time
+    const sortedGroups = [...groups].sort((a, b) => a.arrivalTime - b.arrivalTime);
+
+    for (const group of sortedGroups) {
+      this.joinWaitlist(group);
+
+      // Try to seat immediately if suitable table available
+      const tableIndex = availableTables.findIndex(
+        t => !t.occupied && t.capacity >= group.size
+      );
+
+      if (tableIndex !== -1) {
+        const table = availableTables[tableIndex];
+        table.occupied = true;
+        
+        const seatedGroup: SeatedGroup = {
+          ...group,
+          seatedTime: group.arrivalTime,
+          tableId: table.id
+        };
+
+        this.seatedGroups.set(group.id, seatedGroup);
+        this.tables.set(table.id, {
+          ...table,
+          occupiedBy: group.id,
+          occupiedAt: group.arrivalTime
+        });
+        
+        seatingTimes[group.id] = group.arrivalTime;
+        this.leaveWaitlist(group.id);
+      }
+    }
+
+    return {
+      seatingTimes,
+      currentDinerIds: this.getCurrentDinerIds(),
+      waitingGroups: this.getWaitlist()
+    };
+  }
+
+  // Getters
+  getWaitlist(): Group[] {
+    return [...this.waitlist];
+  }
+
+  getSeatedGroups(): SeatedGroup[] {
+    return Array.from(this.seatedGroups.values());
+  }
+
+  getCurrentDinerIds(): string[] {
+    return Array.from(this.seatedGroups.keys());
+  }
+
+  getTables(): TableState[] {
+    return Array.from(this.tables.values());
+  }
+
+  getAvailableTables(): Table[] {
+    return Array.from(this.tables.values())
+      .filter(t => !t.occupiedBy)
+      .map(t => ({ id: t.id, capacity: t.capacity }));
+  }
+
+  getStats() {
+    return {
+      waitlistSize: this.waitlist.length,
+      seatedGroups: this.seatedGroups.size,
+      totalTables: this.tables.size,
+      availableTables: Array.from(this.tables.values()).filter(t => !t.occupiedBy).length,
+      occupiedTables: Array.from(this.tables.values()).filter(t => t.occupiedBy).length
+    };
+  }
+}
+
+// Express API
+const app = express();
+app.use(express.json());
+
+const restaurant = new RestaurantWaitlist(20);
+
+// Initialize default tables
+const defaultTables: Table[] = [
+  { id: 'T1', capacity: 2 },
+  { id: 'T2', capacity: 4 },
+  { id: 'T3', capacity: 6 },
+  { id: 'T4', capacity: 8 }
+];
+
+defaultTables.forEach(table => {
+  restaurant.tableAvailable(table, 0);
+});
+
+// === API Endpoints ===
+
+// POST /api/waitlist - Add group to waitlist
+app.post('/api/waitlist', (req: Request, res: Response) => {
+  const { id, size, arrivalTime } = req.body;
+  
+  if (!id || !size || arrivalTime === undefined) {
+    return res.status(400).json({ 
+      error: 'Missing required fields: id, size, arrivalTime' 
+    });
+  }
+
+  const group: Group = { id, size, arrivalTime };
+  const result = restaurant.joinWaitlist(group);
+  
+  return res.status(result.success ? 200 : 400).json(result);
+});
+
+// DELETE /api/waitlist/:id - Remove group from waitlist
+app.delete('/api/waitlist/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const result = restaurant.leaveWaitlist(id);
+  
+  return res.status(result.success ? 200 : 404).json(result);
+});
+
+// GET /api/waitlist - Get current waitlist
+app.get('/api/waitlist', (req: Request, res: Response) => {
+  const waitlist = restaurant.getWaitlist();
+  return res.status(200).json({ waitlist });
+});
+
+// POST /api/tables/available - Mark table as available (seats first fitting group)
+app.post('/api/tables/available', (req: Request, res: Response) => {
+  const { id, capacity, time } = req.body;
+  
+  if (!id || !capacity || time === undefined) {
+    return res.status(400).json({ 
+      error: 'Missing required fields: id, capacity, time' 
+    });
+  }
+
+  const table: Table = { id, capacity };
+  const result = restaurant.tableAvailable(table, time);
+  
+  return res.status(200).json(result);
+});
+
+// GET /api/tables - Get all tables with their states
+app.get('/api/tables', (req: Request, res: Response) => {
+  const tables = restaurant.getTables();
+  return res.status(200).json({ tables });
+});
+
+// GET /api/tables/available - Get available tables
+app.get('/api/tables/available', (req: Request, res: Response) => {
+  const availableTables = restaurant.getAvailableTables();
+  return res.status(200).json({ availableTables });
+});
+
+// POST /api/groups/:id/leave - Group leaves restaurant
+app.post('/api/groups/:id/leave', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const result = restaurant.groupLeaves(id);
+  
+  return res.status(result.success ? 200 : 404).json(result);
+});
+
+// GET /api/groups/seated - Get all seated groups
+app.get('/api/groups/seated', (req: Request, res: Response) => {
+  const seatedGroups = restaurant.getSeatedGroups();
+  return res.status(200).json({ seatedGroups });
+});
+
+// GET /api/diners/current - Get IDs of currently seated customers (follow-up requirement)
+app.get('/api/diners/current', (req: Request, res: Response) => {
+  const dinerIds = restaurant.getCurrentDinerIds();
+  const details = restaurant.getSeatedGroups();
+  
+  return res.status(200).json({ dinerIds, details });
+});
+
+// POST /api/process-batch - Process batch of groups (main requirement)
+app.post('/api/process-batch', (req: Request, res: Response) => {
+  const { groups, tables } = req.body;
+  
+  if (!groups || !Array.isArray(groups)) {
+    return res.status(400).json({ error: 'Invalid groups array' });
+  }
+  
+  if (!tables || !Array.isArray(tables)) {
+    return res.status(400).json({ error: 'Invalid tables array' });
+  }
+
+  // Validate group format
+  for (const group of groups) {
+    if (!group.id || !group.size || group.arrivalTime === undefined) {
+      return res.status(400).json({ 
+        error: 'Each group must have id, size, and arrivalTime' 
+      });
+    }
+  }
+
+  // Validate table format
+  for (const table of tables) {
+    if (!table.id || !table.capacity) {
+      return res.status(400).json({ 
+        error: 'Each table must have id and capacity' 
+      });
+    }
+  }
+
+  const result = restaurant.processBatch(groups, tables);
+  return res.status(200).json(result);
+});
+
+// GET /api/stats - Get restaurant statistics
+app.get('/api/stats', (req: Request, res: Response) => {
+  const stats = restaurant.getStats();
+  return res.status(200).json(stats);
+});
+
+// GET /health - Health check
+app.get('/health', (req: Request, res: Response) => {
+  return res.status(200).json({ status: 'ok', timestamp: Date.now() });
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`🍽️  Restaurant Waitlist API running on port ${PORT}`);
+  console.log(`📝 API Documentation:`);
+  console.log(`   POST   /api/waitlist - Add group to waitlist`);
+  console.log(`   DELETE /api/waitlist/:id - Remove group from waitlist`);
+  console.log(`   GET    /api/waitlist - View current waitlist`);
+  console.log(`   POST   /api/tables/available - Mark table available`);
+  console.log(`   GET    /api/tables - View all tables`);
+  console.log(`   POST   /api/groups/:id/leave - Group leaves`);
+  console.log(`   GET    /api/diners/current - Current diner IDs`);
+  console.log(`   POST   /api/process-batch - Process batch arrivals`);
+});
+
+export { RestaurantWaitlist, app, Group, Table };
